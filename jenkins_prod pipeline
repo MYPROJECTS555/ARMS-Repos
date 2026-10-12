@@ -1,0 +1,234 @@
+
+pipeline {
+    agent { label 'frontend' }
+
+    options {
+        skipDefaultCheckout(true)
+        timestamps()
+    }
+
+    environment {
+        AWS_REGION       = 'eu-north-1'
+        AWS_ACCOUNT_ID   = credentials('aws-account-id')
+        ECR_REPOSITORY   = 'arms-frontend'
+        EKS_CLUSTER      = 'arms-eks'
+        NAMESPACE        = 'arms'
+        ECR_REGISTRY     = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_IMAGE        = "${ECR_REGISTRY}/${ECR_REPOSITORY}"
+    }
+
+    stages {
+
+        // 1. Validate release tag and check out the tagged commit
+        stage('Checkout Release') {
+            steps {
+                checkout scm
+
+                script {
+                    if (!env.TAG_NAME || !(env.TAG_NAME ==~ /v\d+\.\d+\.\d+/)) {
+                        error('Production requires a release tag such as v1.4.0')
+                    }
+
+                    env.RELEASE_ID = env.TAG_NAME
+                    env.COMMIT_ID = sh(
+                        script: 'git rev-parse --short=7 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.FULL_COMMIT = sh(
+                        script: 'git rev-parse HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.IMAGE_TAG =
+                        "${env.RELEASE_ID}-build${env.BUILD_NUMBER}-${env.COMMIT_ID}"
+
+                    echo "Release ID: ${env.RELEASE_ID}"
+                    echo "Jenkins Build: ${env.BUILD_NUMBER}"
+                    echo "Git Commit: ${env.COMMIT_ID}"
+                    echo "Production Image: ${env.ECR_IMAGE}:${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        // 2. Authenticate to ECR using the Jenkins EC2 IAM role
+        stage('Login to ECR') {
+            steps {
+                sh '''
+                    aws ecr get-login-password \
+                      --region "$AWS_REGION" |
+                    docker login \
+                      --username AWS \
+                      --password-stdin "$ECR_REGISTRY"
+                '''
+            }
+        }
+
+        // 3. Pull the existing image built and tested in STG
+        //    The STG pipeline must have pushed this commit-SHA tag.
+        stage('Retrieve STG Image') {
+            steps {
+                sh '''
+                    docker pull "$ECR_IMAGE:$COMMIT_ID"
+                '''
+
+                script {
+                    env.STG_DIGEST = sh(
+                        script: '''
+                            aws ecr describe-images \
+                              --region "$AWS_REGION" \
+                              --repository-name "$ECR_REPOSITORY" \
+                              --image-ids imageTag="$COMMIT_ID" \
+                              --query 'imageDetails[0].imageDigest' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    if (!env.STG_DIGEST.startsWith('sha256:')) {
+                        error('Could not verify the STG image digest')
+                    }
+
+                    echo "STG image digest: ${env.STG_DIGEST}"
+                }
+            }
+        }
+
+        // 4. Promote the same image; do not rebuild it
+        stage('Tag Production Image') {
+            steps {
+                sh '''
+                    docker tag \
+                      "$ECR_IMAGE:$COMMIT_ID" \
+                      "$ECR_IMAGE:$IMAGE_TAG"
+
+                    docker push "$ECR_IMAGE:$IMAGE_TAG"
+                '''
+
+                script {
+                    env.IMAGE_DIGEST = sh(
+                        script: '''
+                            aws ecr describe-images \
+                              --region "$AWS_REGION" \
+                              --repository-name "$ECR_REPOSITORY" \
+                              --image-ids imageTag="$IMAGE_TAG" \
+                              --query 'imageDetails[0].imageDigest' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    if (env.IMAGE_DIGEST != env.STG_DIGEST) {
+                        error('Image digest mismatch: production image differs from STG image')
+                    }
+
+                    env.IMAGE_REF = "${env.ECR_IMAGE}@${env.IMAGE_DIGEST}"
+
+                    echo "Verified production image: ${env.IMAGE_REF}"
+                }
+            }
+        }
+
+        // 5. Approval before production deployment
+        stage('Production Approval') {
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input(
+                        message: "Deploy ${env.IMAGE_TAG} to production?",
+                        ok: 'Approve Production'
+                    )
+                }
+            }
+        }
+
+        // 6. Configure EKS access
+        stage('Configure EKS Access') {
+            steps {
+                sh '''
+                    aws eks update-kubeconfig \
+                      --region "$AWS_REGION" \
+                      --name "$EKS_CLUSTER"
+                '''
+            }
+        }
+
+        // 7. Deploy the exact verified image digest
+        //    Production manifests must use image: ${IMAGE_REF}
+        stage('Deploy to Production') {
+            steps {
+                sh '''
+                    kubectl apply -f k8s/prod/namespace.yaml
+
+                    kubectl apply \
+                      -f k8s/prod/configmap.yaml \
+                      -n "$NAMESPACE"
+
+                    envsubst < k8s/prod/deployment.yaml |
+                      kubectl apply -n "$NAMESPACE" -f -
+
+                    kubectl apply \
+                      -f k8s/prod/service.yaml \
+                      -n "$NAMESPACE"
+
+                    kubectl apply \
+                      -f k8s/prod/ingress.yaml \
+                      -n "$NAMESPACE"
+
+                    kubectl apply \
+                      -f k8s/prod/hpa.yaml \
+                      -n "$NAMESPACE"
+                '''
+            }
+        }
+
+        // 8. Verify deployment and roll back if rollout fails
+        stage('Deployment Verification') {
+            steps {
+                script {
+                    try {
+                        sh '''
+                            kubectl -n "$NAMESPACE" \
+                              rollout status deployment/arms-frontend \
+                              --timeout=5m
+                        '''
+                    } catch (err) {
+                        echo 'Rollout failed. Rolling back.'
+                        sh '''
+                            kubectl -n "$NAMESPACE" \
+                              rollout undo deployment/arms-frontend
+                        '''
+                        error("Production deployment failed: ${err}")
+                    }
+                }
+            }
+        }
+
+        stage('Verify Resources') {
+            steps {
+                sh '''
+                    kubectl -n "$NAMESPACE" get pods
+                    kubectl -n "$NAMESPACE" get svc
+                    kubectl -n "$NAMESPACE" get ingress
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Production release ${env.RELEASE_ID} deployed."
+            echo "Image: ${env.ECR_IMAGE}:${env.IMAGE_TAG}"
+            echo "Commit: ${env.COMMIT_ID}"
+            echo "Jenkins build: ${env.BUILD_NUMBER}"
+            echo "Image digest: ${env.IMAGE_DIGEST}"
+        }
+
+        failure {
+            echo 'Production release pipeline failed.'
+        }
+
+        always {
+            echo 'Production pipeline completed.'
+        }
+    }
+}
